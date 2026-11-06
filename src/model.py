@@ -234,7 +234,7 @@ class AnimaFlat(nn.Module):
     """Anima diffusion transformer with fused/flattened weights.
 
     Attributes:
-        fused: Use the fused Triton forward when running on CUDA without autograd.
+        fused: Use the fused Triton forward when running on CUDA.
         trim_context: Trim zero-padded text context in `encode_context` (requires FA4; ignored
             while autograd is enabled).
         checkpointing: Recompute each block during backward instead of storing its activations.
@@ -422,7 +422,55 @@ class AnimaFlat(nn.Module):
         )
         return self.unpatchify(self.out_proj(z), H, W)
 
-    @torch.no_grad()
+    def _mlp(self, b: nn.Module, hid: torch.Tensor) -> torch.Tensor:
+        up, down = b.up, b.down  # type: ignore
+        if type(up) is nn.Linear and type(down) is nn.Linear:
+            return mlp(hid, up.weight, down.weight)
+        h = linear_gelu(hid, up.weight) if type(up) is nn.Linear else F.gelu(up(hid)) # type: ignore
+        return down(h) # type: ignore
+
+    def _fused_block(
+        self,
+        l: int,
+        hid: torch.Tensor,
+        z: torch.Tensor,
+        mod: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        ctx: Context,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        c, b = self.cfg, self.blocks[l]
+        q, k, v = qkv_norm_rope(
+            b.qkv(hid),  # type: ignore
+            b.q_norm,
+            b.k_norm,
+            cos,
+            sin,
+            c.heads,
+            c.qk_eps,
+        )
+        hid, z = residual_adaln(
+            b.o1(attention(q, k, v)),  # type: ignore
+            z,
+            mod[l, 0, 2],
+            mod[l, 1, 0],
+            mod[l, 1, 1],
+        )
+        q = head_norm(b.xq(hid), b.xq_norm, c.heads, c.qk_eps)  # type: ignore
+        hid, z = residual_adaln(
+            b.o2(ctx.attend(l, q)),  # type: ignore
+            z,
+            mod[l, 1, 2],
+            mod[l, 2, 0],
+            mod[l, 2, 1],
+        )
+        y = self._mlp(b, hid)
+        if l + 1 < c.layers:
+            return residual_adaln(
+                y, z, mod[l, 2, 2], mod[l + 1, 0, 0], mod[l + 1, 0, 1]
+            )
+        return y, z
+
     def forward_fused(
         self,
         x: torch.Tensor,
@@ -430,7 +478,10 @@ class AnimaFlat(nn.Module):
         ctx: Context,
         mods: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Inference forward pass using the fused Triton kernels (CUDA only, no autograd).
+        """Forward pass using the fused Triton kernels (CUDA only; differentiable).
+
+        With autograd enabled and `checkpointing` set, each block is recomputed during backward
+        and only its input is stored. LoRA adapters are applied.
 
         Args:
             x: Noisy latent, shape `[B, H, W, C]`, on CUDA.
@@ -442,48 +493,23 @@ class AnimaFlat(nn.Module):
         Returns:
             Predicted velocity, shape `[B, H, W, C]`.
         """
-        c = self.cfg
         _, H, W, _ = x.shape  # B, H, W, C
         cos, sin = self.tables(H // 2, W // 2, x.device)
         z = self.patchify(x)
         mod, fin = mods if mods is not None else self.modulation(t, z.dtype)
         mod = mod.permute(1, 2, 3, 0, 4).contiguous()
         hid = adaln(z, mod[0, 0, 0], mod[0, 0, 1])
-        for l, b in enumerate(self.blocks):
-            q, k, v = qkv_norm_rope(
-                b.qkv(hid),  # type: ignore
-                b.q_norm,
-                b.k_norm,
-                cos,
-                sin,
-                c.heads,
-                c.qk_eps,
-            )
-            hid, z = residual_adaln(
-                b.o1(attention(q, k, v)),  # type: ignore
-                z,
-                mod[l, 0, 2],
-                mod[l, 1, 0],
-                mod[l, 1, 1],
-            )
-            q = head_norm(b.xq(hid), b.xq_norm, c.heads, c.qk_eps)  # type: ignore
-            hid, z = residual_adaln(
-                b.o2(ctx.attend(l, q)),  # type: ignore
-                z,
-                mod[l, 1, 2],
-                mod[l, 2, 0],
-                mod[l, 2, 1],
-            )
-            y = b.down(linear_gelu(hid, b.up.weight))  # type: ignore
-            if l + 1 < c.layers:
-                hid, z = residual_adaln(
-                    y, z, mod[l, 2, 2], mod[l + 1, 0, 0], mod[l + 1, 0, 1]
-                )
+        remat = self.checkpointing and torch.is_grad_enabled()
+        for l in range(self.cfg.layers):
+            args = (l, hid, z, mod, cos, sin, ctx)
+            if remat:
+                hid, z = checkpoint(self._fused_block, *args, use_reentrant=False)
+            else:
+                hid, z = self._fused_block(*args)
         shift, scale = fin.chunk(2, dim=-1)
-        hid, _ = residual_adaln(y, z, mod[-1, 2, 2], shift, scale + 1)  # type: ignore
+        hid, _ = residual_adaln(hid, z, mod[-1, 2, 2], shift, scale + 1)  # type: ignore
         return self.unpatchify(self.out_proj(hid), H, W)
 
-    @torch.no_grad()
     def enable_fp8(self, fast_accum: bool = False) -> None:
         """Run inference with FP8 attention and MLP projections.
 
@@ -590,8 +616,9 @@ class AnimaFlat(nn.Module):
     ) -> torch.Tensor:
         """Predict the velocity for a noisy latent.
 
-        Dispatches to `forward_fp8` or `forward_fused` when `fused` is set, `x` is on CUDA, autograd is
-        disabled and no LoRA adapter is attached; otherwise to `forward_reference`.
+        Dispatches to `forward_fp8` when FP8 is enabled, autograd is disabled and no LoRA adapter is
+        attached, to `forward_fused` for other CUDA inputs when `fused` is set, and to
+        `forward_reference` otherwise.
 
         Args:
             x: Noisy latent, shape `[B, H, W, C]`.
@@ -602,13 +629,12 @@ class AnimaFlat(nn.Module):
         Returns:
             Predicted velocity, shape `[B, H, W, C]`.
         """
-        if (
-            self.fused
-            and x.is_cuda
-            and not torch.is_grad_enabled()
-            and not has_lora(self)
-        ):
-            if self.fp8 is not None:
+        if self.fused and x.is_cuda:
+            if (
+                self.fp8 is not None
+                and not torch.is_grad_enabled()
+                and not has_lora(self)
+            ):
                 return self.forward_fp8(x, t, ctx, mods)
             return self.forward_fused(x, t, ctx, mods)
         return self.forward_reference(x, t, ctx, mods)
