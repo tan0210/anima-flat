@@ -2,7 +2,7 @@ import torch
 import triton
 from triton import language as tl
 
-from .common import _check
+from .common import _check, tuned_rows
 
 _HEAD_CONFIGS = [
     triton.Config({"HPP": hpp}, num_warps=nw) for hpp in (2, 4, 8, 16) for nw in (4, 8)
@@ -217,7 +217,6 @@ def _(x, weight, heads, eps):
     return x.new_empty((x.shape[0], x.shape[1], heads, weight.numel()))
 
 
-_BWD_ROWS = 16
 _BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8)]
 
 
@@ -275,7 +274,7 @@ def _section_bwd(
     return tl.sum(da * xa, axis=0), tl.sum(db * xb, axis=0)
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF"])
+@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"])
 @triton.jit
 def _qkv_norm_rope_bwd_kernel(
     qkv_ptr,
@@ -384,7 +383,7 @@ def _qkv_norm_rope_bwd_kernel(
         tl.store(out + HALF + dim, acc_b)
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF"])
+@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"])
 @triton.jit
 def _head_norm_bwd_kernel(
     x_ptr,
@@ -446,22 +445,29 @@ def _head_norm_bwd(x, dy, weight, heads, eps):
     hd = weight.numel()
     hpp = _bwd_hpp(heads)
     groups = triton.cdiv(heads, hpp)
-    chunks = B * triton.cdiv(S, _BWD_ROWS)
-    dx = torch.empty_like(x)
-    pw = torch.empty(chunks, groups, hd, dtype=torch.float32, device=x.device)
-    _head_norm_bwd_kernel[(chunks, groups)](
-        x,
-        dy.contiguous(),
-        dx,
-        weight,
-        pw,
-        S,
-        eps,
-        HEADS=heads,
-        HALF=hd // 2,
-        HPP=hpp,
-        ROWS=_BWD_ROWS,
-    )
+    dy = dy.contiguous()
+
+    def launch(rows):
+        chunks = B * triton.cdiv(S, rows)
+        dx = torch.empty_like(x)
+        pw = torch.empty(chunks, groups, hd, dtype=torch.float32, device=x.device)
+        _head_norm_bwd_kernel[(chunks, groups)](
+            x,
+            dy,
+            dx,
+            weight,
+            pw,
+            S,
+            eps,
+            HEADS=heads,
+            HALF=hd // 2,
+            HPP=hpp,
+            ROWS=rows,
+        )
+        return dx, pw
+
+    rows = tuned_rows(("head_norm_bwd", B, S, heads, hd, x.dtype), launch)
+    dx, pw = launch(rows)
     return dx, pw.sum((0, 1)).to(weight.dtype)
 
 
@@ -526,27 +532,36 @@ def _qkv_norm_rope_backward(ctx, dq, dk, dv):
     half = cos.shape[1]
     hpp = _bwd_hpp(heads)
     gq = triton.cdiv(heads, hpp)
-    chunks = B * triton.cdiv(S, _BWD_ROWS)
-    dqkv = torch.empty_like(qkv)
-    pw = torch.empty(chunks, 3 * gq, 2 * half, dtype=torch.float32, device=qkv.device)
-    _qkv_norm_rope_bwd_kernel[(chunks, 3 * gq)](
-        qkv,
-        dq.contiguous(),
-        dk.contiguous(),
-        dv.contiguous(),
-        dqkv,
-        q_weight,
-        k_weight,
-        cos,
-        sin,
-        pw,
-        S,
-        eps,
-        HEADS=heads,
-        HALF=half,
-        HPP=hpp,
-        ROWS=_BWD_ROWS,
-    )
+    dq, dk, dv = dq.contiguous(), dk.contiguous(), dv.contiguous()
+
+    def launch(rows):
+        chunks = B * triton.cdiv(S, rows)
+        dqkv = torch.empty_like(qkv)
+        pw = torch.empty(
+            chunks, 3 * gq, 2 * half, dtype=torch.float32, device=qkv.device
+        )
+        _qkv_norm_rope_bwd_kernel[(chunks, 3 * gq)](
+            qkv,
+            dq,
+            dk,
+            dv,
+            dqkv,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            pw,
+            S,
+            eps,
+            HEADS=heads,
+            HALF=half,
+            HPP=hpp,
+            ROWS=rows,
+        )
+        return dqkv, pw
+
+    rows = tuned_rows(("qkv_norm_rope_bwd", B, S, heads, half, qkv.dtype), launch)
+    dqkv, pw = launch(rows)
     dqw = pw[:, :gq].sum((0, 1)).to(q_weight.dtype)
     dkw = pw[:, gq : 2 * gq].sum((0, 1)).to(k_weight.dtype)
     return dqkv, dqw, dkw, None, None, None, None
@@ -585,8 +600,7 @@ def qkv_norm_rope(qkv, q_weight, k_weight, cos, sin, heads, eps=1e-5):
     if torch.is_grad_enabled() and (qkv.requires_grad or q_weight.requires_grad):
         return _qkv_norm_rope_v(*args)
     q, k = _qkv_norm_rope(*args)
-    # V needs no norm or rotation. So we can simply return a strided view
-    # of qkv instead of copying it.
+    # V needs no norm or rotation: return a strided view of qkv instead of copying it.
     B, S, _ = qkv.shape
     v = qkv.view(B, S, 3, heads, 2 * cos.shape[1])[:, :, 2]
     return q, k, v
