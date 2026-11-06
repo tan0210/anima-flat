@@ -75,6 +75,7 @@ def inherit_license(repo: str) -> tuple[dict[str, str], bytes, bytes]:
     Returns:
         The license fields for the new model card (`license`, `license_name`, `license_link`),
         the license text, and the attribution notice the license requires, as a `NOTICE.md` body.
+        The notice ends with a statement that the weights were modified, as derivatives must say.
 
     Raises:
         ValueError: If the repo has no license metadata or the license has no attribution notice.
@@ -87,14 +88,20 @@ def inherit_license(repo: str) -> tuple[dict[str, str], bytes, bytes]:
     with open(hf_hub_download(repo, "LICENSE.md"), "rb") as f:
         lic = f.read()
     m = re.search(
-        "\u201c(The .{0,80} Model is licensed by .*?)\u201d", lic.decode("utf-8"), re.DOTALL
+        "\u201c(The .{0,80} Model is licensed by .*?)\u201d",
+        lic.decode("utf-8"),
+        re.DOTALL,
     )
     if not m:
         raise ValueError(f"{repo}/LICENSE.md contains no attribution notice")
     meta = {"license": front["license"], "license_link": "LICENSE.md"}
     if front.get("license_name"):
         meta["license_name"] = front["license_name"]
-    return meta, lic, (m.group(1).strip() + "\n").encode("utf-8")
+    notice = (
+        f"{m.group(1).strip()}\n\n"
+        f"These weights are a modified version of {repo}, converted or fine-tuned with anima-flat.\n"
+    )
+    return meta, lic, notice.encode("utf-8")
 
 
 def model_card(
@@ -135,7 +142,7 @@ def model_card(
         else f'model = load("{ckpt}", lora="{lora}")'
     )
     lic = (
-        "\nThese weights are derivatives of Anima and carry its license, which allows "
+        "\nThese weights are modified derivatives of Anima and carry its license, which allows "
         "non-commercial use only. See `LICENSE.md` and `NOTICE.md`.\n"
         if license_meta
         else ""
