@@ -115,7 +115,8 @@ predicted velocity, which is visually equivalent on the images above but will ch
 
 ### Which GPUs does it run on?
 
-It is developed and benchmarked on an H200. The Triton kernels run on other CUDA GPUs, and the FlashAttention-4 and
+It is developed and benchmarked on an H200, with an H100 NVL baseline in [docs/h100-profile.md](docs/h100-profile.md).
+A CUDA GPU is required; there is no CPU path. The Triton kernels run on other CUDA GPUs, and the FlashAttention-4 and
 QuACK paths are used where available, with PyTorch fallbacks otherwise. FP8 needs a Hopper or newer GPU.
 
 ### Should I use FP8?

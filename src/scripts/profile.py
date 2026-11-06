@@ -341,18 +341,12 @@ def run_forward(pipe, tr, model, args, dtype, device, size, flops):
             return_dict=False,
         )
 
-    model.fused, model.trim_context = True, False
+    model.trim_context = False
     cached = model.encode_context(ctx)
 
     def ours():
         return model(xo, t32, cached)
 
-    model.fused = False
-
-    def ours_ref():
-        return model(xo, t32, cached)
-
-    model.fused = True
     results = {}
     with torch.no_grad():
         s_hf = bench(hf, args.warmup, args.iters, device)
@@ -388,18 +382,6 @@ def run_forward(pipe, tr, model, args, dtype, device, size, flops):
                 peak_gb(ours, device),
             )
             model.disable_fp8()
-        model.fused = False
-        s_r = bench(ours_ref, args.warmup, args.iters, device)
-        add_row(
-            "forward",
-            "ours reference path",
-            size,
-            s_r,
-            s_hf["median"],
-            flops,
-            peak_gb(ours_ref, device),
-        )
-        model.fused = True
         if profiled(args, size):
             ih = profile_call(
                 hf,
@@ -434,11 +416,11 @@ def run_forward(pipe, tr, model, args, dtype, device, size, flops):
                     device,
                     args.profile_iters,
                     args.top,
-                    s_f["median"], # type: ignore
+                    s_f["median"],  # type: ignore
                 )
                 model.disable_fp8()
                 results["ours_fp8"] = iq
-                tf_q = flops / (s_f["median"] / 1e3) / 1e12 # type: ignore
+                tf_q = flops / (s_f["median"] / 1e3) / 1e12  # type: ignore
                 lines += hints("ours fp8", iq, args.peak_tflops, tf_q)
             if lines:
                 print("\n### Hints\n")
@@ -468,7 +450,7 @@ def run_e2e(pipe, model, args, dtype, device, size):
         n = max(cond.shape[1], unc.shape[1])
         cond_p, unc_p = pad_to(cond, n), pad_to(unc, n)
         x = lat[:, :, 0].permute(0, 2, 3, 1).contiguous().to(device)
-        model.fused, model.trim_context = device.startswith("cuda"), False
+        model.trim_context = False
 
         def enc():
             encode_prompt(pipe, args.prompt, device, dtype)

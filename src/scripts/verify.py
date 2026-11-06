@@ -4,7 +4,7 @@ import tempfile
 
 import numpy as np
 import torch
-from diffusers import ModularPipeline
+from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 from PIL import Image
 
 from ..attention import use_fa4
@@ -64,7 +64,9 @@ def check_weights(tr) -> None:
             b = back[k].view(D, C + 1, 2, 2)
             if not torch.equal(a[:, :C], b[:, :C]):
                 bad.append(k)
-            print(f"       padding-mask channel |w|max = {a[:, C].abs().max().item():.3e}")
+            print(
+                f"       padding-mask channel |w|max = {a[:, C].abs().max().item():.3e}"
+            )
         elif not torch.equal(sd[k], back[k]):
             bad.append(k)
     check("weights round-trip exactly", not bad, f"mismatched: {bad[:6]}")
@@ -76,11 +78,13 @@ def convert_copy(tr, dtype, device, qk_eps) -> AnimaFlat:
         tr.save_pretrained(src)
         path = os.path.join(d, "flat.safetensors")
         convert_checkpoint(src, path, qk_eps=qk_eps)
-        return load(path, device=device, dtype=dtype, fused=False)
+        return load(path, device=device, dtype=dtype)
 
 
 @torch.no_grad()
-def check_forward(tr, model: AnimaFlat, dtype, device, size, ctx_len, tol, seed=0) -> None:
+def check_forward(
+    tr, model: AnimaFlat, dtype, device, size, ctx_len, tol, seed=0
+) -> None:
     H = W = size // 8
     C = model.cfg.in_ch
     B = 2
@@ -95,53 +99,80 @@ def check_forward(tr, model: AnimaFlat, dtype, device, size, ctx_len, tol, seed=
 
     acts_ref, acts_our, hooks = {}, {}, []
     for i, b in enumerate(tr.transformer_blocks):
-        hooks.append(b.register_forward_hook(
-            lambda _m, _i, o, i=i: acts_ref.__setitem__(i, (o[0] if isinstance(o, tuple) else o).float())
-        ))
-    for i, b in enumerate(model.blocks):
-        hooks.append(b.register_forward_hook(
-            lambda _m, _i, o, i=i: acts_our.__setitem__(i, o.float())
-        ))
+        hooks.append(
+            b.register_forward_hook(
+                lambda _m, _i, o, i=i: acts_ref.__setitem__(
+                    i, (o[0] if isinstance(o, tuple) else o).float()
+                )
+            )
+        )
     ref = tr(
-        hidden_states=x_d, timestep=t.to(device, dtype), encoder_hidden_states=ctx_d,
-        padding_mask=pad, return_dict=False,
+        hidden_states=x_d,
+        timestep=t.to(device, dtype),
+        encoder_hidden_states=ctx_d,
+        padding_mask=pad,
+        return_dict=False,
     )[0]
     ref = ref[:, :, 0].permute(0, 2, 3, 1)  # [B, H, W, C]
-
-    xo = x[:, :, 0].permute(0, 2, 3, 1).contiguous().to(device, dtype)
-    model.fused, model.trim_context = False, False
-    out = model(xo, t.to(device), model.encode_context(ctx_d))
     for h in hooks:
         h.remove()
 
-    errs = [rel_err(acts_our[i], acts_ref[i]) for i in sorted(acts_ref)]
+    # A block returns its updated residual stream except for the last one, whose residual is
+    # added by the output layer, so that one is covered by the final output check.
+    run_block = model._fused_block
+
+    def record(l, *args):
+        out = run_block(l, *args)
+        if l + 1 < model.cfg.layers:
+            acts_our[l] = out[1].float()
+        return out
+
+    xo = x[:, :, 0].permute(0, 2, 3, 1).contiguous().to(device, dtype)
+    model.trim_context = False
+    model._fused_block = record  # type: ignore
+    try:
+        out = model(xo, t.to(device), model.encode_context(ctx_d))
+    finally:
+        del model._fused_block
+
+    errs = [rel_err(acts_our[i], acts_ref[i]) for i in sorted(acts_our)]
     print("       per-block relative error: " + " ".join(f"{e:.1e}" for e in errs))
     check("per-block outputs match", max(errs) < tol, f"max {max(errs):.2e}")
-    check("reference-path output matches diffusers", rel_err(out, ref) < tol,
-          f"rel err {rel_err(out, ref):.2e}")
-
-    if device != "cpu" and torch.cuda.is_available():
-        model.fused = True
-        out_f = model(xo, t.to(device), model.encode_context(ctx_d))
-        check("fused-path output matches diffusers", rel_err(out_f, ref) < tol,
-              f"rel err {rel_err(out_f, ref):.2e}")
-        if use_fa4(xo):
-            model.trim_context = True
-            out_t = model(xo, t.to(device), model.encode_context(ctx_d))
-            model.trim_context = False
-            check("trimmed-context output matches diffusers", rel_err(out_t, ref) < tol,
-                  f"rel err {rel_err(out_t, ref):.2e}")
+    check(
+        "output matches diffusers",
+        rel_err(out, ref) < tol,
+        f"rel err {rel_err(out, ref):.2e}",
+    )
+    if use_fa4(xo):
+        model.trim_context = True
+        out_t = model(xo, t.to(device), model.encode_context(ctx_d))
+        model.trim_context = False
+        check(
+            "trimmed-context output matches diffusers",
+            rel_err(out_t, ref) < tol,
+            f"rel err {rel_err(out_t, ref):.2e}",
+        )
 
 
 @torch.no_grad()
 def encode_prompt(pipe, prompt: str, device, dtype) -> torch.Tensor:
-    qwen = pipe.tokenizer([prompt], padding="longest", max_length=512, truncation=True,
-                          return_tensors="pt")
+    qwen = pipe.tokenizer(
+        [prompt],
+        padding="longest",
+        max_length=512,
+        truncation=True,
+        return_tensors="pt",
+    )
     ids, mask = qwen.input_ids.to(device), qwen.attention_mask.to(device)
     h = pipe.text_encoder(input_ids=ids, attention_mask=mask).last_hidden_state
     h = h * mask.to(h).unsqueeze(-1)
-    t5 = pipe.t5_tokenizer([prompt], padding="longest", max_length=512, truncation=True,
-                           return_tensors="pt")
+    t5 = pipe.t5_tokenizer(
+        [prompt],
+        padding="longest",
+        max_length=512,
+        truncation=True,
+        return_tensors="pt",
+    )
     out = pipe.text_conditioner(
         source_hidden_states=h.to(pipe.text_conditioner.dtype),
         target_input_ids=t5.input_ids.to(device),
@@ -174,8 +205,12 @@ def check_generation(pipe, model, args, dtype, device) -> None:
     lat = torch.randn(1, C, 1, size // 8, size // 8, generator=g)
 
     ref_img = pipe(
-        prompt=args.prompt, negative_prompt=args.negative, num_inference_steps=args.steps,
-        height=size, width=size, latents=lat.to(device).clone(),
+        prompt=args.prompt,
+        negative_prompt=args.negative,
+        num_inference_steps=args.steps,
+        height=size,
+        width=size,
+        latents=lat.to(device).clone(),
     ).images[0]
     ref = np.asarray(ref_img.convert("RGB"))
 
@@ -183,9 +218,10 @@ def check_generation(pipe, model, args, dtype, device) -> None:
     unc = encode_prompt(pipe, args.negative, device, dtype)
     n = max(cond.shape[1], unc.shape[1])
     cond, unc = pad_to(cond, n), pad_to(unc, n)
-    model.fused = device != "cpu"
     x = lat[:, :, 0].permute(0, 2, 3, 1).contiguous().to(device)
-    out = model.denoise(cond, unc, x, args.steps, scale=4.0, shift=pipe.scheduler.config.shift)
+    out = model.denoise(
+        cond, unc, x, args.steps, scale=4.0, shift=pipe.scheduler.config.shift
+    )
     ours = decode_ours(pipe, out)
 
     Image.fromarray(ref).save(os.path.join(args.out, "reference.png"))
@@ -196,10 +232,15 @@ def check_generation(pipe, model, args, dtype, device) -> None:
     diff = ref.astype(np.float32) - ours.astype(np.float32)
     mse = float((diff**2).mean())
     psnr = float("inf") if mse == 0 else 10 * np.log10(255.0**2 / mse)
-    print(f"       mean abs pixel diff {np.abs(diff).mean():.2f}, PSNR {psnr:.1f} dB; "
-          f"images in {args.out}/")
-    check("generated image resembles diffusers' image", psnr >= args.min_psnr,
-          f"PSNR {psnr:.1f} dB (min {args.min_psnr})")
+    print(
+        f"       mean abs pixel diff {np.abs(diff).mean():.2f}, PSNR {psnr:.1f} dB; "
+        f"images in {args.out}/"
+    )
+    check(
+        "generated image resembles diffusers' image",
+        psnr >= args.min_psnr,
+        f"PSNR {psnr:.1f} dB (min {args.min_psnr})",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,23 +259,37 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=main.__doc__)
     ap.add_argument("--repo", default="circlestone-labs/Anima-Base-v1.0-Diffusers")
     ap.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--prompt", default="masterpiece, best quality, 1girl, solo, city lights")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--prompt", default="masterpiece, best quality, 1girl, solo, city lights"
+    )
     ap.add_argument("--negative", default=NEGATIVE)
-    ap.add_argument("--size", type=int, default=512, help="Image side in pixels (multiple of 16).")
+    ap.add_argument(
+        "--size", type=int, default=512, help="Image side in pixels (multiple of 16)."
+    )
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ctx-len", type=int, default=512)
     ap.add_argument("--qk-eps", type=float, default=1e-5)
-    ap.add_argument("--tol", type=float, default=None,
-                    help="Max relative error for forward checks (default 5e-2 bf16, 1e-3 fp32).")
+    ap.add_argument(
+        "--tol",
+        type=float,
+        default=None,
+        help="Max relative error for forward checks (default 5e-2 bf16, 1e-3 fp32).",
+    )
     ap.add_argument("--min-psnr", type=float, default=25.0)
     ap.add_argument("--skip-generate", action="store_true")
     ap.add_argument("--out", default="verify_out")
     args = ap.parse_args(argv)
+    if not args.device.startswith("cuda"):
+        ap.error("the flat model needs a CUDA device")
 
     dtype = getattr(torch, args.dtype)
-    tol = args.tol if args.tol is not None else (5e-2 if dtype == torch.bfloat16 else 1e-3)
+    tol = (
+        args.tol
+        if args.tol is not None
+        else (5e-2 if dtype == torch.bfloat16 else 1e-3)
+    )
 
     pipe = ModularPipeline.from_pretrained(args.repo)
     pipe.load_components(dtype=dtype)
