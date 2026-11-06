@@ -135,7 +135,7 @@ def save_checkpoint(
     )
 
 
-def train(
+def finetune(
     model: nn.Module,
     batches: Iterable[dict],
     uncond: torch.Tensor,
