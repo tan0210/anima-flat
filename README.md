@@ -1,5 +1,7 @@
 # anima-flat
 
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Anima--flat--Base-555555)](https://huggingface.co/tan0210/Anima-flat-Base)
+
 Anima-flat is a variant of [Anima](https://huggingface.co/circlestone-labs/Anima), an
 image generation model based on NVIDIA Cosmos-Predict2-2B-Text2Image developed jointly by CircleStone Labs and Comfy Org.
 
@@ -154,8 +156,11 @@ merged at load time with `--lora`.
 
 ### Can I upload weights to Hugging Face?
 
-`python -m src.scripts.export` validates the files and uploads them in one commit. `--license-from` copies the
-upstream model's license and attribution notice into the repo.
+Yes. `python -m src.scripts.export` validates the files and uploads them in one commit. `--license-from` copies the
+upstream model's license into the repo and writes the attribution notice, including the statement that the weights
+were modified. The converted base model is published this way at
+[tan0210/Anima-flat-Base](https://huggingface.co/tan0210/Anima-flat-Base); load it with `load("anima-flat.safetensors")`
+after downloading. Like Anima, it is for non-commercial use only.
 
 ### Does it work in ComfyUI?
 
