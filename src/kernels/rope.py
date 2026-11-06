@@ -471,6 +471,18 @@ def _head_norm_bwd(x, dy, weight, heads, eps):
     return dx, pw.sum((0, 1)).to(weight.dtype)
 
 
+@torch.library.custom_op("anima_flat::head_norm_bwd", mutates_args=())
+def _head_norm_bwd_op(
+    x: torch.Tensor, dy: torch.Tensor, weight: torch.Tensor, heads: int, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _head_norm_bwd(x, dy, weight, heads, eps)
+
+
+@_head_norm_bwd_op.register_fake
+def _(x, dy, weight, heads, eps):
+    return torch.empty_like(x), torch.empty_like(weight)
+
+
 def _head_norm_setup(ctx, inputs, output):
     x, weight, heads, eps = inputs
     ctx.save_for_backward(x, weight)
@@ -480,7 +492,7 @@ def _head_norm_setup(ctx, inputs, output):
 
 def _head_norm_backward(ctx, dy):
     x, weight = ctx.saved_tensors
-    dx, dw = _head_norm_bwd(x, dy, weight, ctx.heads, ctx.eps)
+    dx, dw = _head_norm_bwd_op(x, dy, weight, ctx.heads, ctx.eps)
     return dx, dw, None, None
 
 
@@ -525,9 +537,7 @@ def _qkv_norm_rope_setup(ctx, inputs, output):
     ctx.eps = eps
 
 
-def _qkv_norm_rope_backward(ctx, dq, dk, dv):
-    qkv, q_weight, k_weight, cos, sin = ctx.saved_tensors
-    heads, eps = ctx.heads, ctx.eps
+def _qkv_norm_rope_bwd(qkv, dq, dk, dv, q_weight, k_weight, cos, sin, heads, eps):
     B, S, _ = qkv.shape
     half = cos.shape[1]
     hpp = _bwd_hpp(heads)
@@ -564,6 +574,35 @@ def _qkv_norm_rope_backward(ctx, dq, dk, dv):
     dqkv, pw = launch(rows)
     dqw = pw[:, :gq].sum((0, 1)).to(q_weight.dtype)
     dkw = pw[:, gq : 2 * gq].sum((0, 1)).to(k_weight.dtype)
+    return dqkv, dqw, dkw
+
+
+@torch.library.custom_op("anima_flat::qkv_norm_rope_bwd", mutates_args=())
+def _qkv_norm_rope_bwd_op(
+    qkv: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _qkv_norm_rope_bwd(qkv, dq, dk, dv, q_weight, k_weight, cos, sin, heads, eps)
+
+
+@_qkv_norm_rope_bwd_op.register_fake
+def _(qkv, dq, dk, dv, q_weight, k_weight, cos, sin, heads, eps):
+    return torch.empty_like(qkv), torch.empty_like(q_weight), torch.empty_like(k_weight)
+
+
+def _qkv_norm_rope_backward(ctx, dq, dk, dv):
+    qkv, q_weight, k_weight, cos, sin = ctx.saved_tensors
+    dqkv, dqw, dkw = _qkv_norm_rope_bwd_op(
+        qkv, dq, dk, dv, q_weight, k_weight, cos, sin, ctx.heads, ctx.eps
+    )
     return dqkv, dqw, dkw, None, None, None, None
 
 

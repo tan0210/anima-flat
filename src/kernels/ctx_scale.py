@@ -95,13 +95,10 @@ def _ctx_scale_bwd_kernel(
     )
 
 
-def _ctx_scale_setup(ctx, inputs, output):
-    out, lse, ln_pad = inputs
-    ctx.save_for_backward(out, lse, ln_pad)
-
-
-def _ctx_scale_backward(ctx, dy):
-    out, lse, ln_pad = ctx.saved_tensors
+@torch.library.custom_op("anima_flat::ctx_scale_bwd", mutates_args=())
+def _ctx_scale_bwd_op(
+    out: torch.Tensor, lse: torch.Tensor, ln_pad: torch.Tensor, dy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, S, H, hd = out.shape
     dout = torch.empty_like(out)
     dlse = torch.empty_like(lse)
@@ -117,6 +114,22 @@ def _ctx_scale_backward(ctx, dy):
         HD=tl.constexpr(hd),
         BLOCK_H=tl.constexpr(triton.next_power_of_2(H)),
     )
+    return dout, dlse
+
+
+@_ctx_scale_bwd_op.register_fake
+def _(out, lse, ln_pad, dy):
+    return torch.empty_like(out), torch.empty_like(lse)
+
+
+def _ctx_scale_setup(ctx, inputs, output):
+    out, lse, ln_pad = inputs
+    ctx.save_for_backward(out, lse, ln_pad)
+
+
+def _ctx_scale_backward(ctx, dy):
+    out, lse, ln_pad = ctx.saved_tensors
+    dout, dlse = _ctx_scale_bwd_op(out, lse, ln_pad, dy)
     return dout, dlse, None
 
 

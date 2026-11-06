@@ -217,6 +217,46 @@ def _residual_adaln_bwd(gh, gz, z, x, gate, scale, eps):
     return dz, dx if has_x else None, dgate, dshift, dscale
 
 
+@torch.library.custom_op("anima_flat::residual_adaln_bwd", mutates_args=())
+def _residual_adaln_bwd_op(
+    gh: torch.Tensor,
+    gz: torch.Tensor | None,
+    z: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dres, dx, dgate, dshift, dscale = _residual_adaln_bwd(
+        gh, gz, z, x, gate, scale, eps
+    )
+    return dx, dres, dgate, dshift, dscale  # type: ignore
+
+
+@_residual_adaln_bwd_op.register_fake
+def _(gh, gz, z, x, gate, scale, eps):
+    return (
+        torch.empty_like(x),
+        torch.empty_like(z),
+        torch.empty_like(gate),
+        torch.empty_like(scale),
+        torch.empty_like(scale),
+    )
+
+
+@torch.library.custom_op("anima_flat::adaln_bwd", mutates_args=())
+def _adaln_bwd_op(
+    gh: torch.Tensor, z: torch.Tensor, scale: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dz, _, _, dshift, dscale = _residual_adaln_bwd(gh, None, z, None, None, scale, eps)
+    return dz, dshift, dscale
+
+
+@_adaln_bwd_op.register_fake
+def _(gh, z, scale, eps):
+    return torch.empty_like(z), torch.empty_like(scale), torch.empty_like(scale)
+
+
 def _residual_adaln_setup(ctx, inputs, output):
     x, _, gate, _, scale, eps = inputs
     ctx.save_for_backward(x, gate, scale, output[1])
@@ -225,7 +265,7 @@ def _residual_adaln_setup(ctx, inputs, output):
 
 def _residual_adaln_backward(ctx, gh, gz):
     x, gate, scale, z = ctx.saved_tensors
-    dres, dx, dgate, dshift, dscale = _residual_adaln_bwd(
+    dx, dres, dgate, dshift, dscale = _residual_adaln_bwd_op(
         gh, gz, z, x, gate, scale, ctx.eps
     )
     return dx, dres, dgate, dshift, dscale, None
@@ -246,9 +286,7 @@ def _adaln_setup(ctx, inputs, output):
 
 def _adaln_backward(ctx, gh):
     z, scale = ctx.saved_tensors
-    dz, _, _, dshift, dscale = _residual_adaln_bwd(
-        gh, None, z, None, None, scale, ctx.eps
-    )
+    dz, dshift, dscale = _adaln_bwd_op(gh, z, scale, ctx.eps)
     return dz, dshift, dscale, None
 
 
