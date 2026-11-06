@@ -96,6 +96,8 @@ The main difference between the Flat implementations is GEMM time: FP8 reduces G
 
 - **The cross-GPU ratios are consistent with the H200 run.** At 1024×1024, FP8 is 1.27x faster than BF16 on H100 NVL vs. 1.26x on H200. Flat BF16 is 1.96x faster than Diffusers on H100 NVL vs. 2.08x on H200.
 
+- **The reference-path rows are historical.** They come from a run made before the reference forward was removed; current profile runs no longer produce them.
+
 - **There is no pre-restructure H100 baseline.** This run therefore cannot establish whether restructuring the fused forward pass into a per-block helper changed forward performance. Future H100 runs should be compared against this baseline.
 
 - **GEMM and attention dominate kernel time.** Together they account for 82% of FP8 kernel time and 93% of BF16 kernel time. The custom Triton kernels account for 17% of FP8 forward time.

@@ -84,23 +84,6 @@ def rope_tables(
     return ang.cos(), ang.sin()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary embeddings (half-split convention) in float32.
-
-    Args:
-        x: Input, shape `[B, S, H, hd]`.
-        cos: Cosine table, shape `[S, hd // 2]`.
-        sin: Sine table, shape `[S, hd // 2]`.
-
-    Returns:
-        Rotated tensor with the shape and dtype of `x`.
-    """
-    x1, x2 = x.float().chunk(2, dim=-1)
-    c = cos[None, :, None, :]
-    s = sin[None, :, None, :]
-    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1).to(x.dtype)
-
-
 class Context:
     """Precomputed per-layer cross-attention keys/values for one text context.
 
@@ -137,7 +120,9 @@ class Context:
 
 
 class Block(nn.Module):
-    """One transformer block: self-attention, cross-attention and MLP, each adaLN-modulated.
+    """Parameters of one transformer block: self-attention, cross-attention and MLP.
+
+    The computation is `AnimaFlat.forward_fused`; a block has no forward of its own.
 
     Args:
         c: Model config.
@@ -146,7 +131,6 @@ class Block(nn.Module):
     def __init__(self, c: FlatConfig) -> None:
         super().__init__()
         D, hd = c.dim, c.head_dim
-        self.heads, self.hd, self.eps = c.heads, hd, c.qk_eps
         self.qkv = nn.Linear(D, 3 * D, bias=False)
         self.q_norm = nn.Parameter(torch.ones(hd))
         self.k_norm = nn.Parameter(torch.ones(hd))
@@ -159,73 +143,6 @@ class Block(nn.Module):
         self.up = nn.Linear(D, c.mlp_dim, bias=False)
         self.down = nn.Linear(c.mlp_dim, D, bias=False)
 
-    def modulate(
-        self, x: torch.Tensor, m: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Parameter-free LayerNorm followed by shift/scale modulation.
-
-        Args:
-            x: Tokens, shape `[B, S, D]`.
-            m: Modulation for one sub-layer, shape `[B, 3, D]` ordered (shift, scale + 1, gate).
-
-        Returns:
-            `(y, gate)`: modulated tokens `[B, S, D]` and the gate `[B, 1, D]`.
-        """
-        shift, scale, gate = (t[:, None] for t in m.unbind(1))
-        return F.layer_norm(x, x.shape[-1:], eps=NORM_EPS) * scale + shift, gate
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        ck: torch.Tensor,
-        cv: torch.Tensor,
-        m: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        trim: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """Reference block forward.
-
-        Args:
-            x: Tokens, shape `[B, S, D]`.
-            ck: This block's cross-attention keys, shape `[B, Sc, H, hd]`.
-            cv: This block's cross-attention values, shape `[B, Sc, H, hd]`.
-            m: Modulation for this block, shape `[B, 3, 3, D]`.
-            cos: Rotary cosines, shape `[S, hd // 2]`.
-            sin: Rotary sines, shape `[S, hd // 2]`.
-            trim: `(seqused, ln_pad)` from a trimmed `Context`, or None for full cross-attention.
-
-        Returns:
-            Updated tokens, shape `[B, S, D]`.
-        """
-        B, S, _ = x.shape  # B, S, D
-        y, g = self.modulate(x, m[:, 0])
-        q, k, v = self.qkv(y).view(B, S, 3, self.heads, self.hd).unbind(2)
-        q = apply_rope(
-            F.rms_norm(q, (self.hd,), self.q_norm.to(q.dtype), self.eps), cos, sin
-        )
-        k = apply_rope(
-            F.rms_norm(k, (self.hd,), self.k_norm.to(k.dtype), self.eps), cos, sin
-        )
-        x = x + g * self.o1(attention(q, k, v))
-        y, g = self.modulate(x, m[:, 1])
-        q = self.xq(y).view(B, S, self.heads, self.hd)
-        q = F.rms_norm(q, (self.hd,), self.xq_norm.to(q.dtype), self.eps)
-        if trim is None:
-            c = attention(q, ck, cv)
-        else:
-            c = cross_attention_trimmed(q, ck, cv, *trim)
-        x = x + g * self.o2(c)
-        y, g = self.modulate(x, m[:, 2])
-        # Adapters wrapping `up` or `down` must run inside the MLP, so only plain layers fuse.
-        if type(self.up) is nn.Linear:
-            if type(self.down) is nn.Linear:
-                return x + g * mlp(y, self.up.weight, self.down.weight)
-            h = linear_gelu(y, self.up.weight)
-        else:
-            h = F.gelu(self.up(y))
-        return x + g * self.down(h)
-
 
 FP8_LAYERS = ("qkv", "o1", "xq", "o2", "up", "down")
 
@@ -234,12 +151,10 @@ class AnimaFlat(nn.Module):
     """Anima diffusion transformer with fused/flattened weights.
 
     Attributes:
-        fused: Use the fused Triton forward when running on CUDA.
         trim_context: Trim zero-padded text context in `encode_context` (requires FA4; ignored
             while autograd is enabled).
         checkpointing: Recompute each block during backward instead of storing its activations.
             Only matters while autograd is enabled.
-        compile_blocks: Run the blocks of `forward_reference` through `torch.compile`.
 
     Args:
         cfg: Model config.
@@ -249,11 +164,8 @@ class AnimaFlat(nn.Module):
         super().__init__()
         self.cfg = cfg
         D, L, R = cfg.dim, cfg.layers, cfg.lora_dim
-        self.fused = True
         self.trim_context = False
         self.checkpointing = True
-        self.compile_blocks = False
-        self._compiled = {}
         self.patch = nn.Linear(4 * cfg.in_ch, D, bias=False)
         self.t_lin1 = nn.Linear(D, D, bias=False)
         self.t_lin2 = nn.Linear(D, 3 * D, bias=False)
@@ -375,59 +287,12 @@ class AnimaFlat(nn.Module):
         y = y.reshape(B, H // 2, W // 2, 2, 2, C).permute(0, 1, 3, 2, 4, 5)
         return y.reshape(B, H, W, C)
 
-    def _block(self, i: int) -> nn.Module:
-        b = self.blocks[i]
-        if not self.compile_blocks:
-            return b
-        if i not in self._compiled:
-            self._compiled[i] = torch.compile(b)
-        return self._compiled[i]
-
-    def forward_reference(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        ctx: Context,
-        mods: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """Unfused forward pass in plain PyTorch (differentiable).
-
-        Args:
-            x: Noisy latent, shape `[B, H, W, C]`.
-            t: Timesteps (sigmas), shape `[B]`; ignored if `mods` is given.
-            ctx: Context from `encode_context`.
-            mods: Optional precomputed `(mod, fin)` as returned by `modulation`, with batch size `B`
-                (broadcast views are fine).
-
-        Returns:
-            Predicted velocity, shape `[B, H, W, C]`.
-        """
-        _, H, W, _ = x.shape  # B, H, W, C
-        cos, sin = self.tables(H // 2, W // 2, x.device)
-        z = self.patchify(x)
-        mod, fin = mods if mods is not None else self.modulation(t, z.dtype)
-        trim = None if ctx.seqused is None else (ctx.seqused, ctx.ln_pad)
-        for i in range(len(self.blocks)):
-            b = self._block(i)
-            k, v = ctx.kv[i]
-            args = (z, k, v, mod[:, i], cos, sin, trim)
-            if self.checkpointing and torch.is_grad_enabled():
-                z = checkpoint(b, *args, use_reentrant=False)
-            else:
-                z = b(*args)
-        shift, scale = fin.chunk(2, dim=-1)
-        z = (
-            F.layer_norm(z, z.shape[-1:], eps=NORM_EPS) * (1 + scale[:, None])
-            + shift[:, None]
-        )
-        return self.unpatchify(self.out_proj(z), H, W)
-
     def _mlp(self, b: nn.Module, hid: torch.Tensor) -> torch.Tensor:
         up, down = b.up, b.down  # type: ignore
         if type(up) is nn.Linear and type(down) is nn.Linear:
             return mlp(hid, up.weight, down.weight)
-        h = linear_gelu(hid, up.weight) if type(up) is nn.Linear else F.gelu(up(hid)) # type: ignore
-        return down(h) # type: ignore
+        h = linear_gelu(hid, up.weight) if type(up) is nn.Linear else F.gelu(up(hid))  # type: ignore
+        return down(h)  # type: ignore
 
     def _fused_block(
         self,
@@ -514,8 +379,8 @@ class AnimaFlat(nn.Module):
         """Run inference with FP8 attention and MLP projections.
 
         Quantizes the current weights, so call it after merging any LoRA adapter and after the
-        model is on its final device; call it again after changing the weights. Training and the
-        reference forward keep using the original weights.
+        model is on its final device; call it again after changing the weights. Training keeps using
+        the original weights.
 
         Args:
             fast_accum: Accumulate with reduced precision for extra speed.
@@ -616,9 +481,8 @@ class AnimaFlat(nn.Module):
     ) -> torch.Tensor:
         """Predict the velocity for a noisy latent.
 
-        Dispatches to `forward_fp8` when FP8 is enabled, autograd is disabled and no LoRA adapter is
-        attached, to `forward_fused` for other CUDA inputs when `fused` is set, and to
-        `forward_reference` otherwise.
+        Uses `forward_fp8` when FP8 is enabled, autograd is disabled and no LoRA adapter is attached,
+        and `forward_fused` otherwise.
 
         Args:
             x: Noisy latent, shape `[B, H, W, C]`.
@@ -628,16 +492,15 @@ class AnimaFlat(nn.Module):
 
         Returns:
             Predicted velocity, shape `[B, H, W, C]`.
+
+        Raises:
+            ValueError: If `x` is not on CUDA.
         """
-        if self.fused and x.is_cuda:
-            if (
-                self.fp8 is not None
-                and not torch.is_grad_enabled()
-                and not has_lora(self)
-            ):
-                return self.forward_fp8(x, t, ctx, mods)
-            return self.forward_fused(x, t, ctx, mods)
-        return self.forward_reference(x, t, ctx, mods)
+        if not x.is_cuda:
+            raise ValueError("AnimaFlat needs CUDA tensors")
+        if self.fp8 is not None and not torch.is_grad_enabled() and not has_lora(self):
+            return self.forward_fp8(x, t, ctx, mods)
+        return self.forward_fused(x, t, ctx, mods)
 
     @torch.no_grad()
     def denoise(
@@ -730,7 +593,6 @@ def load(
     dtype: torch.dtype = torch.bfloat16,
     modulation_dtype: torch.dtype = torch.float32,
     norm_dtype: torch.dtype = torch.float32,
-    fused: bool = True,
     trim_context: bool = False,
     lora: str | None = None,
     lora_strength: float = 1.0,
@@ -743,7 +605,6 @@ def load(
         dtype: Dtype of ordinary weights.
         modulation_dtype: Dtype of the modulation weights.
         norm_dtype: Dtype of the q/k norm weights.
-        fused: Initial value of `AnimaFlat.fused`.
         trim_context: Initial value of `AnimaFlat.trim_context`.
         lora: Optional `anima-flat-lora-1` adapter file to merge into the weights.
         lora_strength: Multiplier applied to the adapter when merging.
@@ -768,7 +629,6 @@ def load(
         model = AnimaFlat(cfg)
     model.load_state_dict(sd, strict=True, assign=True)
     model.requires_grad_(False)
-    model.fused = fused
     model.trim_context = trim_context
     if lora is not None:
         merge_lora_file(model, lora, lora_strength)

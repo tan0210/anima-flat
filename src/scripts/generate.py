@@ -113,23 +113,26 @@ def load_models(args: argparse.Namespace) -> tuple[ModularPipeline, AnimaFlat]:
 
     Returns:
         The diffusers pipeline (for text encoding and decoding) and the flat model in eval mode.
+
+    Raises:
+        ValueError: If `args.device` is not a CUDA device.
     """
+    if not args.device.startswith("cuda"):
+        raise ValueError("the flat model needs a CUDA device")
     dtype = getattr(torch, args.dtype)
     pipe = ModularPipeline.from_pretrained(args.repo)
     pipe.load_components(dtype=dtype)
     pipe.to(args.device)
-    cuda = args.device.startswith("cuda")
     if args.checkpoint:
-        model = load(args.checkpoint, device=args.device, dtype=dtype, fused=cuda)
+        model = load(args.checkpoint, device=args.device, dtype=dtype)
     else:
         model = convert_copy(pipe.transformer.eval(), dtype, args.device, args.qk_eps)
-        model.fused = cuda
     if args.lora:
         merge_lora_file(model, args.lora, args.lora_strength)
     model.trim_context = args.trim_context
     if args.fp8:
         model.enable_fp8()
-    if args.compile_vae and cuda:
+    if args.compile_vae:
         pipe.vae.decoder = torch.compile(pipe.vae.decoder)
     return pipe, model  # type: ignore
 
