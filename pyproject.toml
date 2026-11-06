@@ -1,0 +1,44 @@
+[project]
+name = "anima-flat"
+version = "0.1.0"
+description = "A faster variant of Anima"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.9",
+  "triton>=3.3; sys_platform == 'linux'",
+  "triton-windows>=3.3; sys_platform == 'win32'",
+  "flash-attn-4; sys_platform == 'linux'",
+  "quack-kernels[cu13]",
+  "matplotlib>=3.9",
+  "numpy>=2.0",
+  "safetensors",
+  "diffusers>=0.42.1",
+  "transformers>=5.22.1",
+  "accelerate>=1.15.0",
+  "torchvision>=0.29.1",
+  "sentencepiece>=0.2.3",
+  "pillow>=13.0.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
