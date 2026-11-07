@@ -2,7 +2,6 @@ import math
 import os
 
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
@@ -10,6 +9,60 @@ from torch import nn
 LORA_FORMAT = "anima-flat-lora-1"
 PARTS = {"qkv": 3, "xkv": 2, "xq": 1, "o1": 1, "o2": 1, "up": 1, "down": 1}
 TARGETS = tuple(PARTS)
+
+
+@torch.library.custom_op("anima_flat::lora_add", mutates_args=())
+def _lora_add(
+    base: torch.Tensor,
+    x: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    a, b = A.to(x.dtype), B.to(x.dtype)
+    parts, o, r = b.shape
+    low = x @ a.T
+    if parts == 1:
+        return torch.addmm(base, low, b[0].T, alpha=scale)
+    out = base.clone()
+    for i in range(parts):
+        out[:, i * o : (i + 1) * o].addmm_(
+            low[:, i * r : (i + 1) * r], b[i].T, alpha=scale
+        )
+    return out
+
+
+@_lora_add.register_fake
+def _(base, x, A, B, scale):
+    return torch.empty_like(base)
+
+
+def _setup_lora_add(ctx, inputs, output):
+    _, x, A, B, scale = inputs
+    ctx.save_for_backward(x, A, B)
+    ctx.scale = scale
+
+
+def _bwd_lora_add(ctx, g):
+    x, A, B = ctx.saved_tensors
+    a, b = A.to(x.dtype), B.to(x.dtype)
+    parts, o, r = b.shape
+    low = x @ a.T
+    dlow = torch.empty_like(low)
+    dB = []
+    for i in range(parts):
+        gi = g[:, i * o : (i + 1) * o]
+        dlow[:, i * r : (i + 1) * r] = gi @ b[i]
+        if ctx.needs_input_grad[3]:
+            dB.append(gi.T @ low[:, i * r : (i + 1) * r])
+    dlow.mul_(ctx.scale)
+    dx = dlow @ a if ctx.needs_input_grad[1] else None
+    dA = (dlow.T @ x).float() if ctx.needs_input_grad[2] else None
+    dBs = (torch.stack(dB) * ctx.scale).float() if dB else None
+    return g, dx, dA, dBs, None
+
+
+_lora_add.register_autograd(_bwd_lora_add, setup_context=_setup_lora_add)
 
 
 class LoRALinear(nn.Module):
@@ -68,15 +121,11 @@ class LoRALinear(nn.Module):
         Returns:
             Output in the dtype of `x`, shape `[..., out_features]`.
         """
-        low = F.linear(self.drop(x), self.lora_A.to(x.dtype))
-        if self.parts == 1:
-            delta = F.linear(low, self.lora_B[0].to(x.dtype))
-        else:
-            low = low.unflatten(-1, (self.parts, self.rank))
-            delta = torch.einsum(
-                "...nr,nor->...no", low, self.lora_B.to(x.dtype)
-            ).flatten(-2)
-        return self.base(x) + delta * self.scale
+        lead = x.shape[:-1]
+        flat = x.reshape(-1, x.shape[-1])
+        out = self.base(flat)
+        out = _lora_add(out, self.drop(flat), self.lora_A, self.lora_B, self.scale)
+        return out.view(*lead, out.shape[-1])
 
     def delta_weight(self) -> torch.Tensor:
         """Weight update this adapter adds to the base weight.
