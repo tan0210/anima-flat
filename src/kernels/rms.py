@@ -4,7 +4,18 @@ from triton import language as tl
 
 from .common import _check, tuned_rows
 
-_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (2, 4, 8)]
+_CONFIGS = [
+    triton.Config({"R": r}, num_warps=nw)
+    for r in (1, 2, 4, 8, 16, 32, 64)
+    for nw in (2, 4, 8)
+]
+_MAX_TILE = 8192
+
+
+def _prune(configs, named_args, **kwargs):
+    block = kwargs.get("BLOCK")
+    keep = [c for c in configs if block is None or c.kwargs["R"] * block <= _MAX_TILE]
+    return keep or configs[:1]
 
 
 @triton.jit
@@ -21,7 +32,11 @@ def _offset(row, H, W, C, SHUF: tl.constexpr):
     return row * C
 
 
-@triton.autotune(configs=_CONFIGS, key=["C"])
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["C", "HAS_R", "SHUF"],
+    prune_configs_by={"early_config_prune": _prune},
+)
 @triton.jit
 def _fwd_kernel(
     x_ptr,
@@ -29,39 +44,41 @@ def _fwd_kernel(
     g_ptr,
     s_ptr,
     y_ptr,
+    N,
     H,
     W,
     C: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_R: tl.constexpr,
     SHUF: tl.constexpr,
+    R: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
+    rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R).to(tl.int64)
     cols = tl.arange(0, BLOCK)
-    mask = cols < C
-    x = tl.load(x_ptr + _offset(row, H, W, C, SHUF) + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    mask = (rows < N)[:, None] & (cols < C)[None, :]
+    dst = rows[:, None] * C + cols[None, :]
+    src = _offset(rows, H, W, C, SHUF)[:, None] + cols[None, :]
+    x = tl.load(x_ptr + src, mask=mask, other=0.0).to(tl.float32)
     if HAS_R:
-        r = tl.load(r_ptr + row * C + cols, mask=mask, other=0.0).to(tl.float32)
+        r = tl.load(r_ptr + dst, mask=mask, other=0.0).to(tl.float32)
         s = (x + r).to(s_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(s_ptr + row * C + cols, s.to(s_ptr.dtype.element_ty), mask=mask)
+        tl.store(s_ptr + dst, s.to(s_ptr.dtype.element_ty), mask=mask)
     elif SHUF:
         s = x
-        tl.store(s_ptr + row * C + cols, s.to(s_ptr.dtype.element_ty), mask=mask)
+        tl.store(s_ptr + dst, s.to(s_ptr.dtype.element_ty), mask=mask)
     else:
         s = x
-    rstd = (C**0.5) / tl.maximum(tl.sqrt(tl.sum(s * s, axis=0)), 1e-12)
-    g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    a = s * rstd * g
-    tl.store(
-        y_ptr + row * C + cols,
-        (a * tl.sigmoid(a)).to(y_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    rstd = (C**0.5) / tl.maximum(tl.sqrt(tl.sum(s * s, axis=1)), 1e-12)
+    g = tl.load(g_ptr + cols, mask=cols < C, other=0.0).to(tl.float32)
+    a = s * rstd[:, None] * g[None, :]
+    tl.store(y_ptr + dst, (a * tl.sigmoid(a)).to(y_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=_CONFIGS, key=["C", "ROWS"])
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["C", "ROWS", "HAS_GS", "SHUF"],
+    prune_configs_by={"early_config_prune": _prune},
+)
 @triton.jit
 def _bwd_kernel(
     s_ptr,
@@ -78,33 +95,32 @@ def _bwd_kernel(
     ROWS: tl.constexpr,
     HAS_GS: tl.constexpr,
     SHUF: tl.constexpr,
+    R: tl.constexpr,
 ):
     chunk = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
-    mask = cols < C
-    g = tl.load(g_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(g_ptr + cols, mask=cols < C, other=0.0).to(tl.float32)[None, :]
     acc = tl.zeros([BLOCK], dtype=tl.float32)
-    for i in range(ROWS):
-        row = (chunk * ROWS + i).to(tl.int64)
-        m = cols < tl.where(row < N, C, 0)
-        s = tl.load(s_ptr + row * C + cols, mask=m, other=0.0).to(tl.float32)
-        dy = tl.load(dy_ptr + row * C + cols, mask=m, other=0.0).to(tl.float32)
-        rstd = (C**0.5) / tl.maximum(tl.sqrt(tl.sum(s * s, axis=0)), 1e-12)
+    for i in range(0, ROWS, R):
+        local = i + tl.arange(0, R)
+        rows = (chunk * ROWS).to(tl.int64) + local.to(tl.int64)
+        mask = ((rows < N) & (local < ROWS))[:, None] & (cols < C)[None, :]
+        dst = rows[:, None] * C + cols[None, :]
+        s = tl.load(s_ptr + dst, mask=mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptr + dst, mask=mask, other=0.0).to(tl.float32)
+        rstd = ((C**0.5) / tl.maximum(tl.sqrt(tl.sum(s * s, axis=1)), 1e-12))[:, None]
         n = s * rstd
         a = n * g
         sg = tl.sigmoid(a)
         da = dy * sg * (1.0 + a * (1.0 - sg))
-        acc += da * n
+        acc += tl.sum(da * n, axis=0)
         dn = da * g
-        ds = rstd * (dn - n * (tl.sum(dn * n, axis=0) / C))
+        ds = rstd * (dn - n * (tl.sum(dn * n, axis=1) / C)[:, None])
         if HAS_GS:
-            ds += tl.load(gs_ptr + row * C + cols, mask=m, other=0.0).to(tl.float32)
-        tl.store(
-            ds_ptr + _offset(row, H, W, C, SHUF) + cols,
-            ds.to(ds_ptr.dtype.element_ty),
-            mask=m,
-        )
-    tl.store(pg_ptr + chunk * C + cols, acc, mask=mask)
+            ds += tl.load(gs_ptr + dst, mask=mask, other=0.0).to(tl.float32)
+        out = _offset(rows, H, W, C, SHUF)[:, None] + cols[None, :]
+        tl.store(ds_ptr + out, ds.to(ds_ptr.dtype.element_ty), mask=mask)
+    tl.store(pg_ptr + chunk * C + cols, acc, mask=cols < C)
 
 
 def _launch_fwd(x, r, g, shuf):
@@ -122,12 +138,13 @@ def _launch_fwd(x, r, g, shuf):
         if (r is not None or shuf)
         else x
     )
-    _fwd_kernel[(N,)](
+    _fwd_kernel[lambda meta: (triton.cdiv(N, meta["R"]),)](
         x,
         r if r is not None else x,
         g,
         s,
         y,
+        N,
         H,
         W,
         C=C,
