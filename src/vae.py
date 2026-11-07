@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from torch import nn
 
 from .kernels.rms import add_rms_silu, rms_silu, shuffle_rms_silu
@@ -16,6 +17,9 @@ except Exception:  # noqa: BLE001
 _PHASE = torch.tensor(
     [[[1.0, 0, 0], [0, 1, 1], [0, 0, 0]], [[0, 0, 0], [1, 1, 0], [0, 0, 1]]]
 )
+
+
+PREFIX = "vae."
 
 
 def _p(t: torch.Tensor) -> nn.Parameter:
@@ -127,6 +131,54 @@ class VAE(nn.Module):
             _p(_conv2d_weight(dec.conv_out)),  # type: ignore
             _p(dec.conv_out.bias),  # type: ignore
         )
+
+    @classmethod
+    def from_state_dict(cls, sd: dict[str, torch.Tensor]) -> "VAE":
+        """Rebuild the decoder from the tensors of `state_dict()`.
+
+        Args:
+            sd: Tensors as returned by `state_dict()`, including `mean` and `std`.
+
+        Returns:
+            The decoder holding copies of `sd`'s tensors.
+        """
+        m = cls.__new__(cls)
+        nn.Module.__init__(m)
+        m.register_buffer("mean", sd["mean"].clone())
+        m.register_buffer("std", sd["std"].clone())
+
+        def make(prefix: str) -> _Res:
+            r = _Res.__new__(_Res)
+            nn.Module.__init__(r)
+            for n in ("g1", "w1", "b1", "g2", "w2", "b2"):
+                setattr(r, n, _p(sd[prefix + n]))
+            r.has_shortcut = prefix + "sw" in sd
+            if r.has_shortcut:
+                r.sw, r.sb = _p(sd[prefix + "sw"]), _p(sd[prefix + "sb"])
+            return r
+
+        for n in ("post_w", "post_b", "in_w", "in_b", "attn_g", "qkv_w", "qkv_b"):
+            setattr(m, n, _p(sd[n]))
+        for n in ("proj_w", "proj_b", "out_g", "out_w", "out_b"):
+            setattr(m, n, _p(sd[n]))
+        m.mid0, m.mid1 = make("mid0."), make("mid1.")
+        m.blocks = nn.ModuleList()
+        i = 0
+        while f"blocks.{i}.0.g1" in sd:
+            j = 0
+            res = []
+            while f"blocks.{i}.{j}.g1" in sd:
+                res.append(make(f"blocks.{i}.{j}."))
+                j += 1
+            m.blocks.append(nn.ModuleList(res))
+            i += 1
+        m.up_w, m.up_b = nn.ParameterList(), nn.ParameterList()
+        k = 0
+        while f"up_w.{k}" in sd:
+            m.up_w.append(_p(sd[f"up_w.{k}"]))
+            m.up_b.append(_p(sd[f"up_b.{k}"]))
+            k += 1
+        return m
 
     def copy_to(self, vae: nn.Module) -> None:
         """Write the decoder weights into a diffusers VAE of the same architecture.
@@ -241,3 +293,28 @@ class VAE(nn.Module):
             1, -1, 1, 1
         )
         return self(z.to(self.in_w.dtype)).clamp(-1, 1)
+
+
+def load_vae(
+    path: str,
+    device: str | torch.device = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> VAE | None:
+    """Load the decoder stored in an `anima-flat-1` checkpoint.
+
+    Args:
+        path: Checkpoint file written by `convert_checkpoint`.
+        device: Device to load the weights onto.
+        dtype: Dtype of the decoder weights.
+
+    Returns:
+        The decoder in eval mode, or `None` if the file holds no decoder weights.
+    """
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = [k for k in f.keys() if k.startswith(PREFIX)]  # noqa: SIM118
+        if not keys:
+            return None
+        sd = {k[len(PREFIX) :]: f.get_tensor(k) for k in keys}
+    vae = VAE.from_state_dict(sd)
+    vae.requires_grad_(False)
+    return vae.to(device, dtype).eval()

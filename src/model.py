@@ -624,6 +624,7 @@ def load(
         sd = {
             k: f.get_tensor(k).to(group_dtype(k, dtype, modulation_dtype, norm_dtype))
             for k in f.keys()  # noqa: SIM118
+            if not k.startswith("vae.")
         }
     with torch.device("meta"):
         model = AnimaFlat(cfg)

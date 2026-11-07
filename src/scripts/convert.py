@@ -164,6 +164,7 @@ def convert_checkpoint(
     dst_path: str | os.PathLike,
     qk_eps: float = 1e-5,
     dtype: torch.dtype | None = None,
+    vae_dir: str | os.PathLike | None = None,
 ) -> FlatConfig:
     """Convert a diffusers transformer directory into an `anima-flat-1` safetensors file.
 
@@ -172,6 +173,8 @@ def convert_checkpoint(
         dst_path: Output safetensors path.
         qk_eps: Epsilon of the q/k RMS norms, stored in the config.
         dtype: If given, cast all tensors to this dtype before saving.
+        vae_dir: Optional diffusers VAE directory (`AutoencoderKLQwenImage`); its decoder is stored
+            in the file so that `load_vae` can use it without the diffusers repo.
 
     Returns:
         The config written to the file's metadata.
@@ -188,8 +191,23 @@ def convert_checkpoint(
     flat = from_diffusers(sd, cfg)
     if dtype is not None:
         flat = {k: v.to(dtype).contiguous() for k, v in flat.items()}
+    if vae_dir is not None:
+        from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
+            AutoencoderKLQwenImage,
+        )
+
+        from ..vae import PREFIX, VAE
+
+        vae = VAE(AutoencoderKLQwenImage.from_pretrained(vae_dir))
+        for k, v in vae.state_dict().items():
+            keep = k in ("mean", "std")
+            v = v.detach().cpu()
+            flat[PREFIX + k] = (
+                v if keep or dtype is None else v.to(dtype)
+            ).contiguous()
     save_file(flat, dst_path, metadata={"format": FORMAT, "config": cfg.dumps()})
     return cfg
+
 
 PROJ = {
     "self_attn.q_proj": ("qkv", 0),
@@ -219,6 +237,7 @@ KOHYA = {k.replace(".", "_"): k for k in PROJ}
 PARTS = {"qkv": 3, "xkv": 2, "xq": 1, "o1": 1, "o2": 1, "up": 1, "down": 1}
 PREFIX = r"^(?:model\.diffusion_model\.|diffusion_model\.|base_model\.model\.transformer\.|base_model\.model\.|transformer\.)?"
 
+
 def split_key(k: str) -> tuple[str | None, str | None]:
     """Split a LoRA tensor name into module stem and role.
 
@@ -230,10 +249,10 @@ def split_key(k: str) -> tuple[str | None, str | None]:
     """
     m = re.search(r"\.lora_(A|B)(?:\.[^.]+)?\.weight$", k)
     if m:
-        return k[:m.start()], m.group(1)
+        return k[: m.start()], m.group(1)
     m = re.search(r"\.lora_(down|up)\.weight$", k)
     if m:
-        return k[:m.start()], "A" if m.group(1) == "down" else "B"
+        return k[: m.start()], "A" if m.group(1) == "down" else "B"
     if k.endswith(".alpha"):
         return k[:-6], "alpha"
     return None, None
@@ -275,13 +294,15 @@ def blockdiag(bs: list[torch.Tensor]) -> torch.Tensor:
     out = bs[0].new_zeros(rows, cols)
     r = c = 0
     for b in bs:
-        out[r:r + b.shape[0], c:c + b.shape[1]] = b
+        out[r : r + b.shape[0], c : c + b.shape[1]] = b
         r += b.shape[0]
         c += b.shape[1]
     return out
 
 
-def convert_lora(sd: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
+def convert_lora(
+    sd: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], list[str]]:
     """Convert a LoRA state dict to the flat layout.
 
     Per-projection factors are fused to match the flat weights: q/k/v (and cross k/v) become one
@@ -355,8 +376,9 @@ def convert_lora_file(src: str | os.PathLike, dst: str | os.PathLike) -> list[st
 
 
 @torch.no_grad()
-def merge_lora(flat: dict[str, torch.Tensor], lora: dict[str, torch.Tensor],
-               strength: float = 1.0) -> dict[str, torch.Tensor]:
+def merge_lora(
+    flat: dict[str, torch.Tensor], lora: dict[str, torch.Tensor], strength: float = 1.0
+) -> dict[str, torch.Tensor]:
     """Merge a flat-layout LoRA into flat model weights.
 
     Computes `W + strength * (B @ A)` in float32 and casts back to each weight's dtype.
@@ -373,7 +395,7 @@ def merge_lora(flat: dict[str, torch.Tensor], lora: dict[str, torch.Tensor],
         KeyError: If a LoRA module has no matching weight in `flat`.
     """
     out = dict(flat)
-    for k in lora: # noqa: PLC0206
+    for k in lora:  # noqa: PLC0206
         if not k.endswith(".lora_A"):
             continue
         base = k[:-7]
