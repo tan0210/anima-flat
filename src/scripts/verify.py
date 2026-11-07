@@ -189,10 +189,15 @@ def pad_to(t: torch.Tensor, n: int) -> torch.Tensor:
 @torch.no_grad()
 def decode_ours(pipe, x: torch.Tensor) -> np.ndarray:
     vae = pipe.vae
-    mean = torch.tensor(vae.config.latents_mean, device=x.device).view(1, -1, 1, 1, 1)
-    std = torch.tensor(vae.config.latents_std, device=x.device).view(1, -1, 1, 1, 1)
-    z = x.permute(0, 3, 1, 2).unsqueeze(2) * std + mean
-    img = vae.decode(z.to(vae.dtype), return_dict=False)[0][:, :, 0]
+    if hasattr(vae, "fast"):
+        img = vae.fast.decode(x)
+    else:
+        mean = torch.tensor(vae.config.latents_mean, device=x.device).view(
+            1, -1, 1, 1, 1
+        )
+        std = torch.tensor(vae.config.latents_std, device=x.device).view(1, -1, 1, 1, 1)
+        z = x.permute(0, 3, 1, 2).unsqueeze(2) * std + mean
+        img = vae.decode(z.to(vae.dtype), return_dict=False)[0][:, :, 0]
     img = (img.float() / 2 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
     return (img * 255).round().astype(np.uint8)
 
