@@ -14,6 +14,7 @@ from ..attention import use_fa4
 from ..kernels.gemm import have_quack
 from ..lora import add_lora, remove_lora
 from ..train import flow_loss
+from ..vae import VAE
 from .verify import NEGATIVE, convert_copy, decode_ours, encode_prompt, pad_to
 
 ROWS: list[dict] = []
@@ -505,7 +506,7 @@ def run_e2e(pipe, model, args, dtype, device, size):
         for name, fn in (
             ("ours: text encode", enc),
             ("ours: denoise", den),
-            ("ours: VAE decode", dec),
+            ("ours: decode", dec),
         ):
             st = bench(fn, 1, args.e2e_iters, device)
             add_row(
@@ -659,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
     pipe.to(device)
     tr = pipe.transformer.eval()
     model = convert_copy(tr, dtype, device, args.qk_eps)
+    pipe.vae.fast = VAE(pipe.vae).to(device, dtype).eval()
 
     gpu = torch.cuda.get_device_name() if device.startswith("cuda") else "cpu"
     env = {

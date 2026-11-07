@@ -10,6 +10,7 @@ from PIL import Image
 from ..lora import merge_lora_file
 from ..model import AnimaFlat, load
 from ..sample import NOISE_SCALES, SAMPLERS, decode, noise
+from ..vae import VAE, load_vae
 from .verify import convert_copy, encode_prompt, pad_to
 
 # Defaults of the reference ComfyUI workflow shipped with the model.
@@ -54,9 +55,14 @@ def add_args(ap: argparse.ArgumentParser) -> None:
         help="FP8 qkv and cross-attention query projections (Hopper or newer; inference only).",
     )
     ap.add_argument(
+        "--diffusers-vae",
+        action="store_true",
+        help="Decode with the diffusers VAE instead of the fused single-frame decoder.",
+    )
+    ap.add_argument(
         "--compile-vae",
         action="store_true",
-        help="Compile the VAE decoder: faster decoding, slower first image and per new resolution.",
+        help="Compile the diffusers VAE decoder and use it (implies --diffusers-vae); slower first image and per new resolution.",
     )
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--negative", default=NEGATIVE)
@@ -108,6 +114,9 @@ def check_size(args: argparse.Namespace) -> None:
 def load_models(args: argparse.Namespace) -> tuple[ModularPipeline, AnimaFlat]:
     """Load the text encoder, VAE and the flat model described by the options.
 
+    The fused decoder comes from the checkpoint when it stores one, and from the diffusers VAE
+    otherwise.
+
     Args:
         args: Options from `add_args`.
 
@@ -134,6 +143,11 @@ def load_models(args: argparse.Namespace) -> tuple[ModularPipeline, AnimaFlat]:
         model.enable_fp8()
     if args.compile_vae:
         pipe.vae.decoder = torch.compile(pipe.vae.decoder)
+    elif not args.diffusers_vae:
+        fast = (
+            load_vae(args.checkpoint, args.device, dtype) if args.checkpoint else None
+        )
+        pipe.vae.fast = fast or VAE(pipe.vae).to(args.device, dtype).eval()
     return pipe, model  # type: ignore
 
 
@@ -199,7 +213,7 @@ def denoise(
 
 
 def decode_latents(pipe: ModularPipeline, x: torch.Tensor) -> torch.Tensor:
-    """Decode latents with the pipeline's VAE.
+    """Decode latents with the fused VAE decoder, or the diffusers VAE with `--diffusers-vae`.
 
     Args:
         pipe: Pipeline providing the VAE.
@@ -209,6 +223,8 @@ def decode_latents(pipe: ModularPipeline, x: torch.Tensor) -> torch.Tensor:
         Images `[B, 3, H, W]` in `[-1, 1]`, left on the device.
     """
     vae = pipe.vae
+    if hasattr(vae, "fast"):
+        return vae.fast.decode(x)
     return decode(vae, vae.config.latents_mean, vae.config.latents_std, x)
 
 
