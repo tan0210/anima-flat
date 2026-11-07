@@ -19,6 +19,7 @@ dependencies = [
   "torchvision>=0.29.1",
   "sentencepiece>=0.2.3",
   "pillow>=13.0.0",
+  "ffpa-attn>=0.2.1",
 ]
 
 [tool.uv]
