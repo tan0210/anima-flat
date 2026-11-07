@@ -55,14 +55,14 @@ def add_args(ap: argparse.ArgumentParser) -> None:
         help="FP8 qkv and cross-attention query projections (Hopper or newer; inference only).",
     )
     ap.add_argument(
-        "--fast-vae",
+        "--diffusers-vae",
         action="store_true",
-        help="Decode with the fused single-frame VAE decoder (CUDA).",
+        help="Decode with the diffusers VAE instead of the fused single-frame decoder.",
     )
     ap.add_argument(
         "--compile-vae",
         action="store_true",
-        help="Compile the VAE decoder: faster decoding, slower first image and per new resolution.",
+        help="Compile the diffusers VAE decoder and use it (implies --diffusers-vae); slower first image and per new resolution.",
     )
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--negative", default=NEGATIVE)
@@ -121,7 +121,7 @@ def load_models(args: argparse.Namespace) -> tuple[ModularPipeline, AnimaFlat]:
         The diffusers pipeline (for text encoding and decoding) and the flat model in eval mode.
 
     Raises:
-        ValueError: If `args.device` is not a CUDA device, or both VAE options are set.
+        ValueError: If `args.device` is not a CUDA device.
     """
     if not args.device.startswith("cuda"):
         raise ValueError("the flat model needs a CUDA device")
@@ -138,12 +138,10 @@ def load_models(args: argparse.Namespace) -> tuple[ModularPipeline, AnimaFlat]:
     model.trim_context = args.trim_context
     if args.fp8:
         model.enable_fp8()
-    if args.fast_vae and args.compile_vae:
-        raise ValueError("--fast-vae and --compile-vae are alternatives")
-    if args.fast_vae:
-        pipe.vae.fast = VAE(pipe.vae).to(args.device, dtype).eval()
-    elif args.compile_vae:
+    if args.compile_vae:
         pipe.vae.decoder = torch.compile(pipe.vae.decoder)
+    elif not args.diffusers_vae:
+        pipe.vae.fast = VAE(pipe.vae).to(args.device, dtype).eval()
     return pipe, model  # type: ignore
 
 
@@ -209,7 +207,7 @@ def denoise(
 
 
 def decode_latents(pipe: ModularPipeline, x: torch.Tensor) -> torch.Tensor:
-    """Decode latents with the pipeline's VAE (the fast decoder if `--fast-vae` was set).
+    """Decode latents with the fused VAE decoder, or the diffusers VAE with `--diffusers-vae`.
 
     Args:
         pipe: Pipeline providing the VAE.

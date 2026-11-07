@@ -79,6 +79,21 @@ def main() -> None:
     with torch.no_grad():
         a, b = ref_decode(z).float().clamp(-1, 1), fast(z).float().clamp(-1, 1)
         err = (a - b).abs().max().item()
+        accuracy = None
+        if dtype != torch.float32:
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cuda.matmul.allow_tf32 = False
+            exact = (
+                AutoencoderKLQwenImage.from_pretrained(  # type: ignore
+                    args.repo, subfolder=args.subfolder, torch_dtype=torch.float32
+                )
+                .cuda()
+                .eval()
+            )
+            r = exact.decode(z.float().unsqueeze(2), return_dict=False)[0][:, :, 0]
+            r = r.clamp(-1, 1)
+            accuracy = [("diffusers", (a - r).abs()), ("Fast", (b - r).abs())]
+            del exact
         t_ref, m_ref = measure(lambda: ref_decode(z))
         t_fast, m_fast = measure(lambda: fast(z))
     rows.append((f"Decode {args.size}px", t_ref, m_ref, t_fast, m_fast))
@@ -103,6 +118,19 @@ def main() -> None:
         (f"Forward and backward {args.crop}px crop", t_ref, m_ref, t_fast, m_fast)
     )
 
+    if accuracy is not None:
+        print(
+            "Error against a float32 diffusers decode (TF32 off), pixels in [-1, 1]:\n"
+        )
+        print("| Decoder | Maximum | Mean | 99.9th percentile |")
+        print("|---|---|---|---|")
+        for name, e in accuracy:
+            sample = e.flatten()[:: max(1, e.numel() // 1_000_000)]
+            q = torch.quantile(sample, 0.999).item()
+            print(
+                f"| {name} | {e.max().item():.4f} | {e.mean().item():.5f} | {q:.4f} |"
+            )
+        print()
     print(
         f"VAE `{args.repo}`, {args.dtype}, maximum absolute pixel difference {err:.4f} (images in [-1, 1])\n"
     )
